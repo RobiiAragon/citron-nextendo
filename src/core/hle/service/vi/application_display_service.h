@@ -61,11 +61,7 @@ public:
     Result GetDisplayVsyncEvent(OutCopyHandle<Kernel::KReadableEvent> out_vsync_event,
                                 u64 display_id);
     Result ConvertScalingMode(Out<ConvertedScaleMode> out_scaling_mode, NintendoScaleMode mode);
-    Result GetIndirectLayerImageMap(
-        Out<u64> out_size, Out<u64> out_stride,
-        OutBuffer<BufferAttr_HipcMapTransferAllowsNonSecure | BufferAttr_HipcMapAlias> out_buffer,
-        s64 width, s64 height, u64 indirect_layer_consumer_handle,
-        ClientAppletResourceUserId aruid);
+    void GetIndirectLayerImageMap(HLERequestContext& ctx);
     Result GetIndirectLayerImageRequiredMemoryInfo(Out<s64> out_size, Out<s64> out_alignment,
                                                    s64 width, s64 height);
 
