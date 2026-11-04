@@ -289,7 +289,8 @@ void RealVfsFilesystem::RemoveReferenceFromListLocked(FileReference& reference) 
 
 RealVfsFile::RealVfsFile(RealVfsFilesystem& base_, std::unique_ptr<FileReference> reference_,
                          const std::string& path_, OpenMode perms_, std::optional<u64> size_)
-    : base(base_), reference(std::move(reference_)), path(path_),
+    : base_owner(base_.weak_from_this().lock()), base(base_), reference(std::move(reference_)),
+      path(path_),
       parent_path(FS::GetParentPath(path_)), path_components(FS::SplitPathComponentsCopy(path_)),
       size(size_), perms(perms_) {}
 
@@ -405,7 +406,8 @@ std::vector<VirtualDir> RealVfsDirectory::IterateEntries<RealVfsDirectory, VfsDi
 
 RealVfsDirectory::RealVfsDirectory(RealVfsFilesystem& base_, const std::string& path_,
                                    OpenMode perms_)
-    : base(base_), path(FS::RemoveTrailingSlash(path_)), parent_path(FS::GetParentPath(path)),
+    : base_owner(base_.weak_from_this().lock()), base(base_), path(FS::RemoveTrailingSlash(path_)),
+      parent_path(FS::GetParentPath(path)),
       path_components(FS::SplitPathComponentsCopy(path)), perms(perms_) {
     if (!FS::Exists(path) && True(perms & OpenMode::Write)) {
         void(FS::CreateDirs(path));

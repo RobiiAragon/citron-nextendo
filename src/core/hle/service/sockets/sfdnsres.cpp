@@ -19,6 +19,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/svc/nextendo_deadline_watch.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/sockets/nextendo_uch.h"
 #include "core/hle/service/sockets/sfdnsres.h"
 #include "core/hle/service/sockets/sockets.h"
 #include "core/hle/service/sockets/sockets_translate.h"
@@ -179,6 +180,114 @@ static std::optional<std::string> GetNextendoRedirectIp(const std::string& host,
     constexpr u64 DragonBallFighterZ = 0x0100A250097F0000ULL;
     if (program_id == DragonBallFighterZ && host == "dbf.channel.or.jp") {
         LOG_INFO(Service, "[Nextendo] Redirecting DBFZ API host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Friday the 13th logs in to IllFonic's own REST backend right after NEX Register.
+    constexpr u64 FridayThe13th = 0x010092A00C4B6000ULL;
+    if (program_id == FridayThe13th && host == "nswitch.f13.illfonic.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting Friday the 13th backend '{}' -> '{}'", host,
+                 server_ip);
+        return server_ip;
+    }
+
+    // Sonic Racing CrossWorlds signs in to Epic Online Services, then to SEGA's own backend
+    // (prod-api/prod-cdn.sora-online.net); our stand-in serves both. EOS P2P relays through
+    // Epic's TURN host with credentials our server issues, so that host goes to our coturn.
+    constexpr u64 SonicRacingCrossWorlds = 0x01006E001823C000ULL;
+    if (program_id == SonicRacingCrossWorlds &&
+        (host == "api.epicgames.dev" || host == "prod-api.sora-online.net" ||
+         host == "prod-cdn.sora-online.net" || host == "turn.rtcp.on.epicgames.com")) {
+        LOG_INFO(Service, "Redirecting CrossWorlds host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Among Us signs in to Epic Online Services, then to Innersloth's account service, and finds
+    // rooms through three regional matchmakers. api.epicgames.dev is shared with other Epic titles,
+    // so it is redirected only while Among Us runs; the Nextendo server forwards anything that is
+    // not Among Us to the real Epic.
+    constexpr u64 AmongUs = 0x0100B0C013912000ULL;
+    if (program_id == AmongUs &&
+        (host == "api.epicgames.dev" || host == "backend.innersloth.com" ||
+         host == "matchmaker.among.us" || host == "matchmaker-eu.among.us" ||
+         host == "matchmaker-as.among.us")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Among Us host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Guilty Gear -Strive- signs in to Epic Online Services at boot, then calls Arc System Works'
+    // API and its two match servers when the player goes online. api.epicgames.dev is shared with
+    // other Epic titles, so it is redirected only while Strive runs. NEXTENDO_GGST_IP points the
+    // four hosts at a local test server without moving the rest of Nextendo.
+    // 0100AB401F136000 is the analysed release (JP cartridge, update 1.08). The US, EU and Asian
+    // IDs come from their DLC/listing IDs and are not checked against a binary yet.
+    const bool is_guilty_gear_strive =
+        program_id == 0x0100AB401F136000ULL || program_id == 0x01002F4020718000ULL ||
+        program_id == 0x01002F402071A000ULL || program_id == 0x010034A020A5C000ULL;
+    if (is_guilty_gear_strive &&
+        (host == "api.epicgames.dev" || host == "switch-ggst-game.guiltygear.com" ||
+         host == "prod-switch-match-ggst-game.guiltygear.com" ||
+         host == "prod-to3match-ggst-game.guiltygear.com")) {
+        const char* ggst_ip = std::getenv("NEXTENDO_GGST_IP");
+        const std::string target = (ggst_ip && *ggst_ip) ? std::string{ggst_ip} : server_ip;
+        LOG_INFO(Service, "[Nextendo] Redirecting Guilty Gear Strive host '{}' -> '{}'", host,
+                 target);
+        return target;
+    }
+
+    // Just Dance 2022: exact service hosts on the lab or deployed Nextendo server.
+    constexpr u64 JustDance2022 = 0x0100EA6014BB8000ULL;
+    if (program_id == JustDance2022 &&
+        (server_ip == "127.0.0.5" || server_ip == "51.178.29.194") &&
+        (host == "public-ubiservices.ubi.com" ||
+         host == "public-ws-ubiservices.ubi.com" || host == "jd.ubisoft.com" ||
+         host == "phonescoring.jd.ubisoft.com" ||
+         host == "v2.phonescoring.jd.ubisoft.com")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Just Dance host '{}' -> '{}'",
+                 host, server_ip);
+        return server_ip;
+    }
+
+    // UNO signs in through Ubisoft's public services endpoint before any matchmaking. The
+    // redirect is limited to that exact host while UNO runs; other Ubisoft titles are untouched.
+    constexpr u64 Uno = 0x0100B6E012EBE000ULL;
+    if (program_id == Uno && host == "public-ubiservices.ubi.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting UNO host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Ultimate Chicken Horse: brainCloud RPC and its three regional allocation hosts, the same names
+    // Prelude writes into the hosts file. Limited to the title so no other game is redirected.
+    if (NextendoUch::IsTitle(program_id) && NextendoUch::IsServiceHost(host)) {
+        LOG_INFO(Service, "[Nextendo] Redirecting UCH host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // SpeedRunners 2 signs in to brainCloud before it uses Photon for rooms. The brainCloud host is shared
+    // with Ultimate Chicken Horse, so redirects apply only while SpeedRunners 2 runs and only for these
+    // exact hosts. Photon matchmaking and gameplay are served independently by Nextendo.
+    constexpr u64 SpeedRunners2 = 0x01004CC023582000ULL;
+    if (program_id == SpeedRunners2 &&
+        (host == "api.braincloudservers.com" || host == "ns.photonengine.io" ||
+         host == "api.gameanalytics.com")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting SpeedRunners 2 host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Crypt of the NecroDancer signs in to brainCloud for its online services.
+    // The host is shared with other brainCloud titles, so it is redirected only while NecroDancer
+    // runs. vortexbuffer.com, which the game also contacts, keeps resolving normally.
+    constexpr u64 CryptOfTheNecroDancer = 0x0100CEA007D08000ULL;
+    if (program_id == CryptOfTheNecroDancer && host == "api.braincloudservers.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting NecroDancer host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // World War Z: Saber's Hydra API (wwz*.wwzapi.com) and RedLynx dispatcher (rlx*.hydrapi.net).
+    constexpr u64 WorldWarZ = 0x010099F013898000ULL;
+    if (program_id == WorldWarZ &&
+        (host.ends_with(".wwzapi.com") || host.ends_with(".hydrapi.net"))) {
+        LOG_INFO(Service, "Redirecting World War Z host '{}' -> '{}'", host, server_ip);
         return server_ip;
     }
 
@@ -861,24 +970,55 @@ void SFDNSRES::GetAddrInfoRequestRaw(HLERequestContext& ctx) {
     rb.Push<u32>(0); // data_size
 }
 
-// Stubs for functions from original registration table not in Switchbrew sfdnsres
+// Numeric getnameinfo: Unreal's FInternetAddr::ToString returns "" when this fails, leaving P2P joins
+// with no host to connect to. Buffers: in 0 = sockaddr, out 0 = host, out 1 = service.
+static GetAddrInfoError GetNameInfoImpl(HLERequestContext& ctx) {
+    const auto addr_buffer = ctx.ReadBuffer(0);
+    if (addr_buffer.size() < sizeof(SockAddrIn)) {
+        return GetAddrInfoError::FAIL;
+    }
+    SockAddrIn addr{};
+    std::memcpy(&addr, addr_buffer.data(), sizeof(addr));
+    if (addr.family != static_cast<u8>(Domain::INET)) {
+        return GetAddrInfoError::FAMILY;
+    }
+
+    const std::string host = Network::IPv4AddressToString(addr.ip);
+    const std::string service = std::to_string(Common::swap16(addr.portno));
+    LOG_DEBUG(Service, "GetNameInfo {}:{}", host, service);
+
+    const std::size_t host_size = ctx.CanWriteBuffer(0) ? ctx.GetWriteBufferSize(0) : 0;
+    const std::size_t service_size = ctx.CanWriteBuffer(1) ? ctx.GetWriteBufferSize(1) : 0;
+    if ((host_size != 0 && host.size() >= host_size) ||
+        (service_size != 0 && service.size() >= service_size)) {
+        return GetAddrInfoError::OVERFLOW_;
+    }
+    if (host_size != 0) {
+        ctx.WriteBuffer(host.c_str(), host.size() + 1, 0);
+    }
+    if (service_size != 0) {
+        ctx.WriteBuffer(service.c_str(), service.size() + 1, 1);
+    }
+    return GetAddrInfoError::SUCCESS;
+}
+
 void SFDNSRES::GetNameInfoRequest(HLERequestContext& ctx) {
-    LOG_WARNING(Service, "(STUBBED) sfdnsres::GetNameInfoRequest called");
-    IPC::ResponseBuilder rb{ctx, 5}; // Similar to GetAddrInfoRequest
+    const GetAddrInfoError gai_error = GetNameInfoImpl(ctx);
+
+    IPC::ResponseBuilder rb{ctx, 4};
     rb.Push(ResultSuccess);
-    rb.PushEnum(static_cast<Errno>(EOPNOTSUPP));
-    rb.PushEnum(GetAddrInfoError::AGAIN); // Changed from INTERNAL to AGAIN
-    rb.Push<u32>(0);
+    rb.PushEnum(gai_error);
+    rb.PushEnum(GetAddrInfoErrorToErrno(gai_error));
 }
 
 void SFDNSRES::GetNameInfoRequestWithOptions(HLERequestContext& ctx) {
-    LOG_WARNING(Service, "(STUBBED) sfdnsres::GetNameInfoRequestWithOptions called");
-    IPC::ResponseBuilder rb{ctx, 6}; // Similar to GetAddrInfoRequestWithOptions
+    const GetAddrInfoError gai_error = GetNameInfoImpl(ctx);
+
+    IPC::ResponseBuilder rb{ctx, 5};
     rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // data_size
-    rb.PushEnum(GetAddrInfoError::AGAIN); // Changed from INTERNAL to AGAIN
-    rb.PushEnum(NetDbError::Internal);    // This should be fine as NetDbError::Internal is defined
-    rb.PushEnum(static_cast<Errno>(EOPNOTSUPP));
+    rb.PushEnum(gai_error);
+    rb.PushEnum(GetAddrInfoErrorToNetDbError(gai_error));
+    rb.PushEnum(GetAddrInfoErrorToErrno(gai_error));
 }
 
 } // namespace Service::Sockets

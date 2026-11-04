@@ -58,6 +58,7 @@
 #include <boost/container/flat_set.hpp>
 
 // VFS includes must be before glad as they will conflict with Windows file api, which uses defines.
+#include "applets/amiibo_picker_dialog.h"
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
 #include "applets/qt_error.h"
@@ -86,6 +87,7 @@
 #include "core/frontend/applets/mii_edit.h"
 #include "core/frontend/applets/software_keyboard.h"
 #include "core/hle/service/acc/profile_manager.h"
+#include "core/hle/service/olsc/nextendo_island.h"
 #include "core/hle/service/am/frontend/applets.h"
 #include "core/hle/service/set/system_settings_server.h"
 #include "frontend_common/content_manager.h"
@@ -203,11 +205,11 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "citron/startup_checks.h"
 #include "citron/uisettings.h"
 #include "citron/theme.h"
+#include "citron/nextendo_package_bcat.h"
 #include "citron/nextendo_splatoon3_bcat.h"
 #include "citron/util/rainbow_style.h"
 #include "common/settings.h"
 #ifdef ENABLE_WEB_SERVICE
-#include "web_service/mk8d_country_flags.h"
 #include "web_service/nextendo_api.h"
 #include "web_service/npln_patch_catalog.h"
 #include "web_service/ssbu_mod_installer.h"
@@ -1379,6 +1381,8 @@ void GMainWindow::InitializeWidgets() {
     multiplayer_state->setVisible(false);
 
     nextendo_controller = new NextendoController(*system, this, this);
+    // [Nextendo] Island uploads left pending (emulator closed during or before the upload).
+    Service::OLSC::NextendoIsland::RunPendingInBackground();
     nextendo_toast = new NextendoToast(this);
     Nextendo::OnlineCounts::Start(this);
     Nextendo::NzpOnlineCount::Start(this);
@@ -1746,7 +1750,7 @@ void GMainWindow::InitializeHotkeys() {
 
     // Link all standard menu actions
     LinkActionShortcut(ui->action_Load_File, QStringLiteral("Load File"));
-    LinkActionShortcut(ui->action_Load_Amiibo, QStringLiteral("Load/Remove Amiibo"));
+    LinkActionShortcut(ui->action_Load_Amiibo, QStringLiteral("Load Amiibo"));
     LinkActionShortcut(ui->action_Exit, QStringLiteral("Exit citron"));
     LinkActionShortcut(ui->action_Restart, QStringLiteral("Restart Emulation"));
     LinkActionShortcut(ui->action_Pause, QStringLiteral("Continue/Pause Emulation"));
@@ -3114,6 +3118,8 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
     UpdateMenuState();
 
     emulation_running = true;
+    // [Nextendo] The island upload of Animal Crossing: New Horizons never runs while it plays.
+    Service::OLSC::NextendoIsland::SetRunningTitle(current_title_id);
     // Honor the persistent setting instead of the UI action state, which
     // can be accidentally toggled by hotkey conflicts during launch.
     if (UISettings::values.fullscreen.GetValue()) {
@@ -3236,6 +3242,12 @@ void GMainWindow::OnEmulationStopped() {
         }
     }
 #endif
+
+    // [Nextendo] Island of Animal Crossing: New Horizons: like the Switch's system service, the
+    // backup enabled in the game is sent after the game, without any window. Marked pending on
+    // disk first; when the window is closing it is only marked and the next launch sends it.
+    Service::OLSC::NextendoIsland::SetRunningTitle(0);
+    Service::OLSC::NextendoIsland::AfterGame(current_title_id, !main_window_is_closing);
 
     // Refresh the game list now that the filesystem is valid again.
     game_list->ClearLaunchOverlays();
@@ -5517,38 +5529,67 @@ void GMainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file
 }
 
 void GMainWindow::OnLoadAmiibo() {
-    if (emu_thread == nullptr || !emu_thread->IsRunning()) {
-        return;
-    }
-    if (is_amiibo_file_select_active) {
+    if (emu_thread == nullptr || !emu_thread->IsRunning() || is_amiibo_file_select_active) {
         return;
     }
 
     auto* virtual_amiibo = input_subsystem->GetVirtualAmiibo();
-
-    // Remove amiibo if one is connected
     if (virtual_amiibo->GetCurrentState() == InputCommon::VirtualAmiibo::State::TagNearby) {
         virtual_amiibo->CloseAmiibo();
         QMessageBox::warning(this, tr("Amiibo"), tr("The current amiibo has been removed"));
         return;
     }
-
     if (virtual_amiibo->GetCurrentState() != InputCommon::VirtualAmiibo::State::WaitingForAmiibo) {
-        QMessageBox::warning(this, tr("Error"), tr("The current game is not looking for amiibos"));
+        QMessageBox error{QMessageBox::Warning, tr("Error"),
+                          tr("The current game is not looking for amiibos"), QMessageBox::Ok,
+                          this};
+        auto* controller = system->HIDCore().GetEmulatedController(
+            Core::HID::NpadIdType::Player1);
+        if (controller) {
+            ControllerShortcut accept_with_a{controller};
+            ControllerShortcut accept_with_b{controller};
+            accept_with_a.SetKey("A");
+            accept_with_b.SetKey("B");
+            connect(&accept_with_a, &ControllerShortcut::Activated, &error,
+                    &QMessageBox::accept, Qt::QueuedConnection);
+            connect(&accept_with_b, &ControllerShortcut::Activated, &error,
+                    &QMessageBox::accept, Qt::QueuedConnection);
+            error.exec();
+        } else {
+            error.exec();
+        }
         return;
     }
 
     is_amiibo_file_select_active = true;
-    const QString extensions{QStringLiteral("*.bin")};
-    const QString file_filter = tr("Amiibo File (%1);; All Files (*.*)").arg(extensions);
-    const QString filename = QFileDialog::getOpenFileName(this, tr("Load Amiibo"), {}, file_filter);
+    const QString title_id = QString::number(system->GetApplicationProcessProgramID(), 16)
+                                 .rightJustified(16, QLatin1Char('0')).toUpper();
+    auto* controller = system->HIDCore().GetEmulatedController(
+        Core::HID::NpadIdType::Player1);
+    AmiiboPickerDialog picker{this, title_id, controller, last_scanned_amiibo_id};
+    const int result = picker.exec();
     is_amiibo_file_select_active = false;
-
-    if (filename.isEmpty()) {
+    if (result != QDialog::Accepted) {
         return;
     }
 
-    LoadAmiibo(filename);
+    if (picker.LoadBinRequested()) {
+        const QString filter = tr("Amiibo File (*.bin);; All Files (*.*)");
+        const QString filename = QFileDialog::getOpenFileName(this, tr("Load Amiibo"), {}, filter);
+        if (!filename.isEmpty()) {
+            LoadAmiibo(filename);
+        }
+        return;
+    }
+
+    const auto scan_result = virtual_amiibo->LoadVirtualAmiibo(
+        picker.SelectedAmiiboId().toStdString(), picker.SelectedAmiiboName().toStdString());
+    if (scan_result != InputCommon::VirtualAmiibo::Info::Success) {
+        QMessageBox::warning(this, tr("Amiibo"),
+                             tr("Citron could not create the selected virtual Amiibo."));
+        return;
+    }
+    last_scanned_amiibo_id = picker.SelectedAmiiboId();
 }
 
 bool GMainWindow::question(QWidget* parent, const QString& title, const QString& text,
@@ -7103,6 +7144,8 @@ void GMainWindow::closeEvent(QCloseEvent* event) {
         }
         ShutdownGame();
     }
+    // [Nextendo] An island upload already running ends first (60 s at most), like Ryujinx.
+    Service::OLSC::NextendoIsland::WaitIdle(60000);
 
     // 2. FORCE the UI to stop talking to controllers
     // Do this BEFORE UnloadInputDevices
@@ -7960,11 +8003,19 @@ constexpr u64 kPokemonViolet = 0x01008F6008C5E000ULL;
 constexpr u64 kPokemonScarlet = 0x0100A3D008C5C000ULL;
 constexpr u64 kPokemonLegendsZa = 0x0100F43008C44000ULL;
 constexpr u64 kNintendoSwitchSports = 0x0100D2F00D5C0000ULL;
+constexpr u64 kPokemonSword = 0x0100ABF008968000ULL;
+constexpr u64 kPokemonShield = 0x01008DB008C2C000ULL;
+// Super Smash Bros. Ultimate reads its main menu news ticker (line_news), gifts (present2)
+// and announcements (popup_news) from its delivery cache; without it the ticker says
+// "Connect to the Internet".
+constexpr u64 kSuperSmashBrosUltimate = 0x01006A800016E000ULL;
 
 // Titles whose BCAT delivery is a plain package from /api/bcat/<title>, installed as-is.
 bool IsNextendoPackageBcatTitle(u64 title_id) {
     return title_id == kPokemonViolet || title_id == kPokemonScarlet ||
-           title_id == kPokemonLegendsZa || title_id == kNintendoSwitchSports;
+           title_id == kPokemonLegendsZa || title_id == kNintendoSwitchSports ||
+           title_id == kPokemonSword || title_id == kPokemonShield ||
+           title_id == kSuperSmashBrosUltimate;
 }
 } // Anonymous namespace
 
@@ -7978,6 +8029,9 @@ bool GMainWindow::NextendoByamlRequired(u64 title_id) const {
     case kPokemonScarlet:
     case kPokemonLegendsZa:
     case kNintendoSwitchSports:
+    case kPokemonSword:
+    case kPokemonShield:
+    case kSuperSmashBrosUltimate:
         return true;
     default:
         return false;
@@ -8131,6 +8185,13 @@ bool GMainWindow::NextendoByamlDownload(u64 title_id) {
     const auto fetch_title_id_hex = fmt::format(
         "{:016X}", (package || title_id == Nextendo::Splatoon3Bcat::TitleId)
                        ? title_id : kCanonicalByamlTitleId);
+    const auto dest_path =
+        Common::FS::GetCitronPath(Common::FS::CitronPath::NANDDir) /
+        fmt::format("system/save/bcat/{}", title_id_hex);
+    if (package) {
+        // Put back a cache left aside by an interrupted swap, even if the server is unreachable.
+        Nextendo::PackageBcat::RecoverInterrupted(dest_path);
+    }
 
     // Always fetch the full seed and compare its hash locally, rather than trusting the
     // server's Last-Modified/304 response as the sole freshness signal — that path could get
@@ -8168,6 +8229,24 @@ bool GMainWindow::NextendoByamlDownload(u64 title_id) {
         return true;
     }
 
+#ifdef CITRON_ENABLE_LIBARCHIVE
+    if (package) {
+        // The package is the title's whole delivery cache (every "<directory>/<file>" of the
+        // zip, e.g. Smash's line_news, present2 and popup_news). Validated in memory, then
+        // swapped in place of the previous folder; a failure keeps the previous cache.
+        try {
+            Nextendo::PackageBcat::Install(zip_bytes, dest_path, server_hash);
+            LOG_INFO(Frontend, "Nextendo BCAT: package for {} installed ({})", title_id_hex,
+                     server_hash);
+            return true;
+        } catch (const std::exception& ex) {
+            LOG_ERROR(Frontend, "Nextendo BCAT: package for {} rejected; keeping cache: {}",
+                      title_id_hex, ex.what());
+            return false;
+        }
+    }
+#endif
+
     const auto tmp_path = Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) /
                           fmt::format("nextendo_byaml_{}.zip", title_id_hex);
     {
@@ -8178,10 +8257,6 @@ bool GMainWindow::NextendoByamlDownload(u64 title_id) {
         out.write(reinterpret_cast<const char*>(zip_bytes.data()),
                   static_cast<std::streamsize>(zip_bytes.size()));
     }
-
-    const auto dest_path =
-        Common::FS::GetCitronPath(Common::FS::CitronPath::NANDDir) /
-        fmt::format("system/save/bcat/{}", title_id_hex);
 
     if (ZipContainsPathTraversal(tmp_path)) {
         LOG_ERROR(Frontend, "Nextendo BCAT: package for {} has unsafe paths", title_id_hex);
@@ -8435,161 +8510,6 @@ void GMainWindow::InstallSsbuSkylineMods(u64 program_id) {
         return;
     }
     RunSsbuSkylineModsInstallWithProgress(program_id);
-#else
-    (void)program_id;
-#endif
-}
-
-GMainWindow::Mk8dCountryFlagOutcome GMainWindow::InstallMk8dCountryFlagBlocking(
-    u64 program_id, std::string country_code) {
-    Mk8dCountryFlagOutcome outcome{};
-#ifdef ENABLE_WEB_SERVICE
-    {
-        const FileSys::PatchManager pm(program_id, system->GetFileSystemController(),
-                                       system->GetContentProvider());
-        const auto metadata = pm.GetControlMetadata();
-        if (metadata.first != nullptr) {
-            outcome.detected_version = metadata.first->GetVersionString();
-        }
-    }
-
-    const auto fetch = WebService::Mk8dCountryFlags::FetchCountryFlagPatch(country_code);
-    outcome.release_page_url = fetch.release_page_url;
-    if (!fetch.success) {
-        outcome.error = fetch.error;
-        return outcome;
-    }
-
-    const auto sdmc_root = Common::FS::GetCitronPath(Common::FS::CitronPath::SDMCDir);
-    const auto exefs_dir = sdmc_root / "atmosphere" / "contents" /
-                           fmt::format("{:016X}", program_id) / "exefs";
-    std::error_code ec;
-    std::filesystem::create_directories(exefs_dir, ec);
-    if (ec) {
-        outcome.error = "failed to create exefs mod folder: " + ec.message();
-        return outcome;
-    }
-
-    const auto ips_path =
-        exefs_dir / (std::string{WebService::Mk8dCountryFlags::MK8D_BUILD_ID} + ".ips");
-    std::ofstream out{ips_path, std::ios::binary};
-    if (!out) {
-        outcome.error = "failed to write patch file to SD card";
-        return outcome;
-    }
-    out.write(reinterpret_cast<const char*>(fetch.data.data()),
-             static_cast<std::streamsize>(fetch.data.size()));
-    outcome.success = true;
-#else
-    (void)program_id;
-    (void)country_code;
-#endif
-    return outcome;
-}
-
-void GMainWindow::RunMk8dCountryFlagInstallWithProgress(u64 program_id,
-                                                        const std::string& country_code) {
-#ifdef ENABLE_WEB_SERVICE
-    QProgressDialog progress(tr("Installing country flag patch..."), QString{}, 0, 0, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setCancelButton(nullptr);
-    progress.show();
-
-    auto future = QtConcurrent::run(
-        [this, program_id, country_code] {
-            return InstallMk8dCountryFlagBlocking(program_id, country_code);
-        });
-    while (!future.isFinished()) {
-        QCoreApplication::processEvents();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    progress.close();
-
-    const auto outcome = future.result();
-    QString summary;
-    if (outcome.success) {
-        summary = tr("Country flag installed. This takes effect the next time you launch "
-                     "Mario Kart 8 Deluxe.");
-        if (!outcome.detected_version.empty() &&
-            outcome.detected_version != WebService::Mk8dCountryFlags::MK8D_REQUIRED_VERSION) {
-            summary += tr("<br><br>Warning: your installed version is %1, but this patch "
-                          "requires version %2. It will not take effect until the game is "
-                          "updated to that version.")
-                          .arg(QString::fromStdString(outcome.detected_version).toHtmlEscaped(),
-                               QString::fromLatin1(
-                                   WebService::Mk8dCountryFlags::MK8D_REQUIRED_VERSION));
-        }
-    } else {
-        summary = tr("Failed to install: %1")
-                     .arg(QString::fromStdString(outcome.error).toHtmlEscaped());
-        if (!outcome.release_page_url.empty()) {
-            summary += tr("<br><br>You can download and install it manually from "
-                          "<a href=\"%1\">%1</a>.")
-                          .arg(QString::fromStdString(outcome.release_page_url));
-        }
-    }
-
-    QMessageBox msg_box(outcome.success ? QMessageBox::Information : QMessageBox::Warning,
-                       tr("MK8D Country Flag"), summary, QMessageBox::Ok, this);
-    if (auto* label = msg_box.findChild<QLabel*>(QStringLiteral("qt_msgbox_label"))) {
-        label->setOpenExternalLinks(true);
-    }
-    msg_box.exec();
-#else
-    (void)program_id;
-    (void)country_code;
-#endif
-}
-
-void GMainWindow::InstallMk8dCountryFlag(u64 program_id) {
-#ifdef ENABLE_WEB_SERVICE
-    if (!WebService::Mk8dCountryFlags::IsMk8dTitleId(program_id)) {
-        return;
-    }
-
-    QDialog dialog(this);
-    dialog.setWindowTitle(tr("Set MK8D Country Flag"));
-
-    auto* layout = new QVBoxLayout(&dialog);
-    auto* info_label = new QLabel(
-        tr("Pick the country you want to appear as online. This writes an exefs patch to "
-           "your SD card and requires Mario Kart 8 Deluxe version %1.")
-            .arg(QString::fromLatin1(WebService::Mk8dCountryFlags::MK8D_REQUIRED_VERSION)));
-    info_label->setWordWrap(true);
-    layout->addWidget(info_label);
-
-    auto* combo = new QComboBox(&dialog);
-    std::vector<WebService::Mk8dCountryFlags::CountryInfo> sorted_countries(
-        WebService::Mk8dCountryFlags::kSupportedCountries.begin(),
-        WebService::Mk8dCountryFlags::kSupportedCountries.end());
-    std::sort(sorted_countries.begin(), sorted_countries.end(),
-             [](const auto& l, const auto& r) { return std::string_view{l.name} <
-                                                       std::string_view{r.name}; });
-    for (const auto& country : sorted_countries) {
-        combo->addItem(QStringLiteral("%1 (%2)")
-                          .arg(QString::fromUtf8(country.name), QString::fromLatin1(country.code)),
-                       QString::fromLatin1(country.code));
-    }
-    layout->addWidget(combo);
-
-    auto* button_box =
-        new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    auto* manual_button =
-        button_box->addButton(tr("Open Download Page"), QDialogButtonBox::ActionRole);
-    connect(manual_button, &QPushButton::clicked, &dialog, [] {
-        QDesktopServices::openUrl(
-            QUrl(QString::fromLatin1(WebService::Mk8dCountryFlags::MK8D_REPO_URL)));
-    });
-    connect(button_box, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(button_box, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    layout->addWidget(button_box);
-
-    if (dialog.exec() != QDialog::Accepted) {
-        return;
-    }
-
-    const std::string country_code = combo->currentData().toString().toStdString();
-    RunMk8dCountryFlagInstallWithProgress(program_id, country_code);
 #else
     (void)program_id;
 #endif

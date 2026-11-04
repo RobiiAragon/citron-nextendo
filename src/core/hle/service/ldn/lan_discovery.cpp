@@ -414,13 +414,18 @@ void LANDiscovery::OnNetworkInfoChanged() {
 }
 
 Network::IPv4Address LANDiscovery::GetLocalIp() const {
-    Network::IPv4Address local_ip{0xFF, 0xFF, 0xFF, 0xFF};
     if (auto room_member = room_network.GetRoomMember().lock()) {
         if (room_member->IsConnected()) {
-            local_ip = room_member->GetFakeIpAddress();
+            return room_member->GetFakeIpAddress();
         }
     }
-    return local_ip;
+    // Offline LDN hosts still need the same address exposed by GetIpv4Address.
+    // Publishing the broadcast address as the host node makes that identity
+    // inconsistent whenever the emulator is not connected to a multiplayer room.
+    if (const auto network_interface = Network::GetSelectedNetworkInterface()) {
+        return Network::TranslateIPv4(network_interface->ip_address);
+    }
+    return {};
 }
 
 template <typename Data>

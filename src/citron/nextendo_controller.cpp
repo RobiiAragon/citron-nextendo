@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -28,6 +30,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/acc/profile_manager.h"
+#include "core/hle/service/olsc/nextendo_island.h"
 #include "common/nextendo_compatible_titles.h"
 #include "citron/nextendo_chat_client.h"
 #include "citron/nextendo_controller.h"
@@ -35,6 +38,7 @@
 #include "citron/nextendo_save_sync.h"
 
 #ifdef ENABLE_WEB_SERVICE
+#include "web_service/game_catalog.h"
 #include "web_service/nextendo_api.h"
 #include "web_service/npln_patch_catalog.h"
 #endif
@@ -48,6 +52,7 @@ NextendoController::NextendoController(Core::System& system_, QWidget* main_wind
     }
 #ifdef ENABLE_WEB_SERVICE
     WebService::NplnPatchCatalog::StartTitleIndexCheck();
+    WebService::GameCatalog::Start();
     Common::NextendoFriends::SetNameResolver(&WebService::NextendoApi::GetNameByPid);
     Common::NextendoFriends::SetPlayHistoryResolver([](u64 pid)
         -> std::optional<Common::NextendoFriends::PlayHistory> {
@@ -88,6 +93,14 @@ NextendoController::NextendoController(Core::System& system_, QWidget* main_wind
         ApplyProfileName(Common::NextendoAccount::GetUsername());
         SyncProfileAvatar();
     }
+
+    // The name saved at sign-in is only a cache: the account's pseudo can change on the website,
+    // the app or a console afterwards. Re-read it now, then every 5 minutes, so the profile the
+    // games read follows it without signing in again.
+    SyncProfileName();
+    profile_name_timer.setInterval(5 * 60 * 1000);
+    connect(&profile_name_timer, &QTimer::timeout, this, &NextendoController::SyncProfileName);
+    profile_name_timer.start();
 }
 
 NextendoController::~NextendoController() = default;
@@ -316,6 +329,11 @@ void NextendoController::ManualSaveDownload(u64 title_id) {
         emit StatusChanged(tr("Stop the running game before downloading a cloud save."));
         return;
     }
+    if (Service::OLSC::NextendoIsland::IsStrict(title_id)) {
+        emit StatusChanged(tr("Your island is restored from the game: press - on the title "
+                              "screen and open the island backup settings."));
+        return;
+    }
     if (!Nextendo::CompatibleTitles::Table().count(title_id)) {
         emit StatusChanged(tr("This game doesn't support cloud saves."));
         return;
@@ -368,12 +386,48 @@ void NextendoController::ApplyProfileName(const std::string& name) {
     }
 
     const std::string trimmed = name.substr(0, profile.username.size() - 1);
+    const std::string current(reinterpret_cast<const char*>(profile.username.data()),
+                              strnlen(reinterpret_cast<const char*>(profile.username.data()),
+                                      profile.username.size()));
+    if (current == trimmed) {
+        return; // already up to date: no save file rewrite every 5 minutes
+    }
     std::fill(profile.username.begin(), profile.username.end(), '\0');
     std::copy(trimmed.begin(), trimmed.end(), profile.username.begin());
 
     profile_manager.SetProfileBase(uuid, profile);
     profile_manager.WriteUserSaveFile();
     LOG_INFO(Frontend, "[Nextendo] Renamed the active profile to the account nickname");
+}
+
+void NextendoController::SyncProfileName() {
+#ifdef ENABLE_WEB_SERVICE
+    if (!Common::NextendoAccount::IsLinked()) {
+        return;
+    }
+    const u64 pid = Common::NextendoAccount::GetPid();
+    std::thread{[this, pid, guard = QPointer<NextendoController>(this)] {
+        const std::string name = WebService::NextendoApi::GetNameByPid(pid);
+        if (name.empty()) {
+            return; // out of reach: keep the profile as it is
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, guard, pid, name] {
+                if (!guard || !Common::NextendoAccount::IsLinked() ||
+                    Common::NextendoAccount::GetPid() != pid) {
+                    return; // signed out or switched account while the request was in flight
+                }
+                if (name != Common::NextendoAccount::GetUsername()) {
+                    Common::NextendoAccount::Save(pid, name, Common::NextendoAccount::GetFriendCode(),
+                                                  Common::NextendoAccount::GetToken());
+                    LOG_INFO(Frontend, "[Nextendo] Account pseudo changed on the server");
+                }
+                ApplyProfileName(name);
+            },
+            Qt::QueuedConnection);
+    }}.detach();
+#endif
 }
 
 void NextendoController::SyncProfileAvatar() {

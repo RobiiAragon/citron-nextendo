@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
 
@@ -297,6 +298,7 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
                         u32 binding, Id type, char type_char, u32 element_size) {
     const Id uniform_type{ctx.TypePointer(spv::StorageClass::Uniform, type)};
     ctx.uniform_types.*member_type = uniform_type;
+    std::unordered_set<u32> decorated_array_types;
 
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
         u32 actual_size = info.constant_buffer_used_sizes[desc.index];
@@ -306,7 +308,9 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
         actual_size = std::max((actual_size + 255U) & ~255U, 256U);
 
         const Id array_type{ctx.TypeArray(type, ctx.Const(actual_size / element_size))};
-        ctx.Decorate(array_type, spv::Decoration::ArrayStride, element_size);
+        if (decorated_array_types.insert(array_type.value).second) {
+            ctx.Decorate(array_type, spv::Decoration::ArrayStride, element_size);
+        }
 
         const Id struct_type{ctx.TypeStruct(array_type)};
         Name(ctx, struct_type, "{}_cbuf_block_{}{}_{}", ctx.stage, type_char, element_size * CHAR_BIT, desc.index);
@@ -1056,18 +1060,20 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {
-    if (!info.uses_rescaling_uniform) {
+    // The bindless handle table shares the rescaling push constant block: a stage may only
+    // declare one push constant block.
+    if (!info.uses_rescaling_uniform && !info.uses_bindless_handle_table) {
         return;
     }
     if (profile.unified_descriptor_binding) {
-        DefineRescalingInputPushConstant();
+        DefineRescalingInputPushConstant(info);
     } else {
         DefineRescalingInputUniformConstant();
     }
 }
 
-void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+void EmitContext::DefineRescalingInputPushConstant(const Info& info) {
+    boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1083,6 +1089,13 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (stage != Stage::Compute) {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
+    }
+    Id bindless_handles_type{};
+    if (info.uses_bindless_handle_table) {
+        bindless_handles_type = TypeArray(U32[1], Const(BINDLESS_HANDLE_TABLE_SIZE));
+        Decorate(bindless_handles_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(bindless_handles_type);
+        bindless_handles_member_index = member_index++;
     }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1101,6 +1114,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
                        spv::Decoration::Offset,
                        static_cast<u32>(offsetof(RescalingLayout, down_factor)));
         MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
+    }
+    if (info.uses_bindless_handle_table) {
+        MemberDecorate(push_constant_struct, bindless_handles_member_index,
+                       spv::Decoration::Offset, BINDLESS_HANDLE_TABLE_OFFSET);
+        MemberName(push_constant_struct, bindless_handles_member_index, "bindless_handles");
     }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
@@ -1415,6 +1433,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
             .sampled_type = sampled_type,
             .pointer_type = pointer_type,
             .image_type = image_type,
+            .type = desc.type,
             .count = desc.count,
             .is_multisample = desc.is_multisample,
         });

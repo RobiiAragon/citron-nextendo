@@ -46,6 +46,9 @@ enum class Errno {
     MSGSIZE,
     DESTADDRREQ,
     INPROGRESS,
+    ALREADY,
+    ISCONN,
+    ADDRINUSE,
     OTHER,
 };
 

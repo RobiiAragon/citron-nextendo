@@ -47,6 +47,7 @@ namespace {
 constexpr const char* CanonicalUrl = "https://nextendo.network";
 constexpr const char* ClientId = AppClientId;
 constexpr int TimeoutSeconds = 15;
+constexpr int CountryTimeoutSeconds = 3;
 
 // Desktop client identifiers are public application metadata, never account credentials.
 std::string PublicDesktopClientId() {
@@ -589,6 +590,43 @@ OnlineStatus GetOnlineStatus() {
 
 
 
+IslandResponse IslandRequest(const std::string& method, const std::string& title_id_hex,
+                             const std::string& suffix, const std::string& body,
+                             const std::vector<std::pair<std::string, std::string>>& headers,
+                             int timeout_seconds) {
+    IslandResponse out;
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return out;
+    }
+    httplib::Client client{BaseUrl()};
+    client.set_connection_timeout(TimeoutSeconds);
+    client.set_read_timeout(timeout_seconds);
+    client.set_write_timeout(timeout_seconds);
+    client.set_follow_location(true);
+    ApplyCaCertPath(client);
+
+    httplib::Headers all = BaseHeaders();
+    all.emplace("Authorization", "Bearer " + token);
+    for (const auto& [key, value] : headers) {
+        all.emplace(key, value);
+    }
+    const std::string path = "/api/save/" + title_id_hex + suffix;
+    auto result = method == "PUT" ? client.Put(path, all, body, "application/octet-stream")
+                                  : client.Get(path, all);
+    if (ClearSessionIfRejected(result) || !result) {
+        if (!result) {
+            LOG_WARNING(WebService, "Nextendo island {} {}: {}", method, path,
+                        httplib::to_string(result.error()));
+        }
+        return out;
+    }
+    out.status = result->status;
+    out.body = std::move(result->body);
+    out.save_rev = result->get_header_value("X-Save-Rev");
+    return out;
+}
+
 std::vector<u8> DownloadBcatSeed(const std::string& title_id_hex) {
     const std::string token = Common::NextendoAccount::GetApiToken();
     const auto result = Send("GET", "/api/bcat/" + title_id_hex, {}, token);
@@ -649,7 +687,8 @@ std::string PushSave(const std::string& title_id_hex, std::span<const u8> data) 
 std::map<std::string, int> GetOnlineCounts() {
     std::map<std::string, int> out;
 
-    const auto result = Send("GET", "/api/online-counts", {}, {});
+    // Aggregate counts of every title in the signed game catalog (one shared, cacheable document).
+    const auto result = Send("GET", "/service-catalog/v1/online-counts", {}, {});
     if (!result || result->status != 200) {
         LOG_WARNING(WebService, "Nextendo online-counts fetch failed (HTTP {})",
                     result ? result->status : 0);
@@ -733,6 +772,77 @@ Profile GetProfile() {
     }
 
     return out;
+}
+
+std::optional<std::string> GetAccountCountry() {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return std::nullopt;
+    }
+
+    // Own client with short timeouts: the game may be waiting for this answer, and the shared
+    // client can be held by a slower request. A 401 is not acted on here; a best-effort lookup
+    // must never sign the player out.
+    httplib::Client client{BaseUrl()};
+    client.set_connection_timeout(CountryTimeoutSeconds);
+    client.set_read_timeout(CountryTimeoutSeconds);
+    client.set_write_timeout(CountryTimeoutSeconds);
+    ApplyCaCertPath(client);
+
+    httplib::Headers headers = BaseHeaders();
+    headers.emplace("Authorization", "Bearer " + token);
+
+    const auto result = client.Get("/api/me", headers);
+    if (!result || result->status != 200) {
+        return std::nullopt;
+    }
+
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        const auto account = json.find("account");
+        if (account == json.end() || !account->is_object()) {
+            return std::nullopt;
+        }
+        const auto country = account->find("country");
+        if (country == account->end() || !country->is_string()) {
+            return std::string{};
+        }
+        return country->get<std::string>();
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> GetAccountNsa() {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return std::nullopt;
+    }
+
+    httplib::Client client{BaseUrl()};
+    client.set_connection_timeout(CountryTimeoutSeconds);
+    client.set_read_timeout(CountryTimeoutSeconds);
+    client.set_write_timeout(CountryTimeoutSeconds);
+    ApplyCaCertPath(client);
+
+    httplib::Headers headers = BaseHeaders();
+    headers.emplace("Authorization", "Bearer " + token);
+
+    const auto result = client.Get("/api/me", headers);
+    if (!result || result->status != 200) {
+        return std::nullopt;
+    }
+
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        const auto nsa = json.find("nsa");
+        if (nsa == json.end() || !nsa->is_string()) {
+            return std::nullopt;
+        }
+        return nsa->get<std::string>();
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
 }
 
 std::string PushProfilePicture(const std::string& image_base64) {

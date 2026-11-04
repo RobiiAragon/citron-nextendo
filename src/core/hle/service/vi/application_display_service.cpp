@@ -2,9 +2,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/nvnflinger/hos_binder_driver.h"
 #include "core/hle/service/nvnflinger/parcel.h"
 #include "core/hle/service/os/event.h"
@@ -39,7 +42,7 @@ IApplicationDisplayService::IApplicationDisplayService(Core::System& system_,
         {2031, C<&IApplicationDisplayService::DestroyStrayLayer>, "DestroyStrayLayer"},
         {2101, C<&IApplicationDisplayService::SetLayerScalingMode>, "SetLayerScalingMode"},
         {2102, C<&IApplicationDisplayService::ConvertScalingMode>, "ConvertScalingMode"},
-        {2450, C<&IApplicationDisplayService::GetIndirectLayerImageMap>, "GetIndirectLayerImageMap"},
+        {2450, &IApplicationDisplayService::GetIndirectLayerImageMap, "GetIndirectLayerImageMap"},
         {2451, nullptr, "GetIndirectLayerImageCropMap"},
         {2460, C<&IApplicationDisplayService::GetIndirectLayerImageRequiredMemoryInfo>, "GetIndirectLayerImageRequiredMemoryInfo"},
         {5202, C<&IApplicationDisplayService::GetDisplayVsyncEvent>, "GetDisplayVsyncEvent"},
@@ -305,29 +308,43 @@ Result IApplicationDisplayService::ConvertScalingMode(Out<ConvertedScaleMode> ou
     }
 }
 
-Result IApplicationDisplayService::GetIndirectLayerImageMap(
-    Out<u64> out_size, Out<u64> out_stride,
-    OutBuffer<BufferAttr_HipcMapTransferAllowsNonSecure | BufferAttr_HipcMapAlias> out_buffer,
-    s64 width, s64 height, u64 indirect_layer_consumer_handle, ClientAppletResourceUserId aruid) {
+void IApplicationDisplayService::GetIndirectLayerImageMap(HLERequestContext& ctx) {
+    IPC::RequestParser rp{ctx};
+    const auto width = rp.Pop<s64>();
+    const auto height = rp.Pop<s64>();
+    const auto indirect_layer_consumer_handle = rp.Pop<u64>();
     LOG_INFO(Service_VI,
              "called, width={}, height={}, indirect_layer_consumer_handle={}, aruid={:#x}", width,
-             height, indirect_layer_consumer_handle, aruid.pid);
+             height, indirect_layer_consumer_handle, ctx.GetPID());
+
+    if (width <= 0 || height <= 0 ||
+        static_cast<u64>(width) >
+            std::numeric_limits<u64>::max() / 4 / static_cast<u64>(height)) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultOperationFailed);
+        return;
+    }
 
     const u64 stride = static_cast<u64>(width) * 4;
     const u64 texture_size = stride * static_cast<u64>(height);
 
-    *out_size = texture_size;
-    *out_stride = stride;
-
-    if (texture_size > 0 && !out_buffer.empty()) {
+    if (ctx.CanWriteBuffer(0) && ctx.GetWriteBufferSize(0) > 0) {
         const auto capture = system.GPU().GetAppletCaptureBuffer();
         if (!capture.empty()) {
-            const size_t copy_size = std::min<size_t>(texture_size, capture.size());
-            std::memcpy(out_buffer.data(), capture.data(), copy_size);
+            const size_t copy_size =
+                std::min<size_t>({texture_size, capture.size(), ctx.GetWriteBufferSize(0)});
+            // The descriptor includes alignment padding beyond the image. The generic
+            // CMIF OutBuffer path writes the entire temporary buffer, including its
+            // uninitialized tail. Write only captured pixels so the caller's padding
+            // (which SM3DW reuses for live objects) remains untouched.
+            ctx.WriteBufferB(capture.data(), copy_size, 0);
         }
     }
 
-    R_SUCCEED();
+    IPC::ResponseBuilder rb{ctx, 6};
+    rb.Push(ResultSuccess);
+    rb.Push(texture_size);
+    rb.Push(stride);
 }
 
 Result IApplicationDisplayService::GetIndirectLayerImageRequiredMemoryInfo(Out<s64> out_size,

@@ -102,10 +102,14 @@ public:
 
     virtual Errno SetRcvBuf(u32 value) = 0;
 
-    // Native sockets report the effective host buffer size. Backends without
-    // a native socket retain the unsupported-option result until implemented.
-    virtual std::pair<u32, Errno> GetSndBuf() { return {0, Errno::INVAL}; }
-    virtual std::pair<u32, Errno> GetRcvBuf() { return {0, Errno::INVAL}; }
+    // Native sockets report the effective host buffer size. Backends without a native socket
+    // keep the unsupported-option result.
+    virtual std::pair<u32, Errno> GetSndBuf() {
+        return {0, Errno::INVAL};
+    }
+    virtual std::pair<u32, Errno> GetRcvBuf() {
+        return {0, Errno::INVAL};
+    }
 
     virtual Errno SetSndTimeo(u32 value) = 0;
 

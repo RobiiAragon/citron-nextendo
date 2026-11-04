@@ -4,6 +4,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -43,7 +44,8 @@ struct FileReference : public Common::IntrusiveListBaseNode<FileReference> {
 class RealVfsFile;
 class RealVfsDirectory;
 
-class RealVfsFilesystem : public VfsFilesystem {
+class RealVfsFilesystem : public VfsFilesystem,
+                          public std::enable_shared_from_this<RealVfsFilesystem> {
 public:
     RealVfsFilesystem();
     ~RealVfsFilesystem() override;
@@ -118,6 +120,9 @@ private:
                 const std::string& path, OpenMode perms = OpenMode::Read,
                 std::optional<u64> size = {});
 
+    // Cached content can outlive the System filesystem that opened it.
+    // Keep shared filesystem owners alive through file/directory destruction.
+    std::shared_ptr<RealVfsFilesystem> base_owner;
     RealVfsFilesystem& base;
     std::unique_ptr<FileReference> reference;
     std::string path;
@@ -163,6 +168,9 @@ private:
     template <typename T, typename R>
     std::vector<std::shared_ptr<R>> IterateEntries() const;
 
+    // Cached content can outlive the System filesystem that opened it.
+    // Keep shared filesystem owners alive through file/directory destruction.
+    std::shared_ptr<RealVfsFilesystem> base_owner;
     RealVfsFilesystem& base;
     std::string path;
     std::string parent_path;

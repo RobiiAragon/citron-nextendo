@@ -20,8 +20,10 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/loader/nextendo_amongus_patch.h"
 #include "core/loader/nextendo_dungeons2_patch.h"
 #include "core/loader/home_nat_patch.h"
+#include "core/loader/nextendo_necrodancer_patch.h"
 #include "core/loader/nextendo_pvzbfn_patch.h"
 #include "core/loader/nextendo_s3_patches.h"
 #include "core/loader/nso.h"
@@ -168,6 +170,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                                                              nso_header.build_id, std::move(image));
         image = Loader::NextendoPvZBfNPatch::ApplyIfMatch(pm->GetTitleID(), nso_header.build_id,
                                                           std::move(image));
+        image = Loader::NextendoAmongUsPatch::ApplyIfMatch(pm->GetTitleID(), std::move(image));
+        image = Loader::NextendoNecroDancerPatch::ApplyIfMatch(pm->GetTitleID(),
+                                                               nso_header.build_id, std::move(image));
         if (image.size() == sizeof(NSOHeader) + section.size()) {
             std::copy(image.begin() + sizeof(NSOHeader), image.end(), section.data());
         }
@@ -225,7 +230,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             Common::HexToString(nso_header.build_id), name);
     }
 #endif
-    if (pm && (catalog_patch || pm->GetTitleID() == CtrTitleId)) {
+    if (pm && (catalog_patch || pm->GetTitleID() == CtrTitleId ||
+               pm->GetTitleID() == 0x0100EA6014BB8000ULL)) {
         std::span<u8> patchable_section(program_image.data() + module_start,
                                         program_image.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());

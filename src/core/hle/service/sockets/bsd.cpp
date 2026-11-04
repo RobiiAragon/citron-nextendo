@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -25,6 +26,7 @@
 #include "common/settings.h"
 #include "common/socket_types.h"
 #include "common/uch_account_transport.h"
+#include "common/swap.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_event.h"
@@ -34,6 +36,7 @@
 #include "core/hle/kernel/svc/nextendo_deadline_watch.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/sockets/bsd.h"
+#include "core/hle/service/sockets/nextendo_uch.h"
 #include "core/hle/service/sockets/sfdnsres.h"
 #include "core/hle/service/sockets/sockets_translate.h"
 #include "core/hle/service/ssl/ssl_pending_registry.h"
@@ -102,9 +105,12 @@ static void StartDrain(ParkedUdpDrain& drain, std::shared_ptr<Network::SocketBas
             std::vector<u8> buffer(2048);
             Network::SockAddrIn addr{};
             const auto [ret, err] = socket->RecvFrom(0, buffer, &addr);
-            if (ret <= 0) {
-                // Timeout (nothing arrived this poll) or the socket genuinely died — either
-                // way, loop back and check `stop` again rather than spinning on an error.
+            if (err != Network::Errno::SUCCESS || ret < 0) {
+                if (err != Network::Errno::AGAIN && err != Network::Errno::TIMEDOUT) {
+                    break;
+                }
+                // A parked nonblocking socket may return AGAIN immediately.
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
             buffer.resize(static_cast<size_t>(ret));
@@ -655,8 +661,19 @@ void BSD::Socket(HLERequestContext& ctx) {
 
     LOG_DEBUG(Service, "called. domain={} type={} protocol={}", domain, type, protocol);
 
-    const auto [fd, bsd_errno] = SocketImpl(static_cast<Domain>(domain), static_cast<Type>(type),
-                                            static_cast<Protocol>(protocol));
+    // Ultimate Chicken Horse opens its UNET transport socket with the selector 0x10000000 and protocol IP,
+    // which has no socket type of its own. It is a datagram socket.
+    u32 effective_type = type;
+    u32 effective_protocol = protocol;
+    if (protocol == static_cast<u32>(Protocol::Unspecified) &&
+        NextendoUch::IsUdpSelector(system.GetApplicationProcessProgramID(), type)) {
+        effective_type = static_cast<u32>(Type::DGRAM);
+        effective_protocol = static_cast<u32>(Protocol::UDP);
+    }
+
+    const auto [fd, bsd_errno] =
+        SocketImpl(static_cast<Domain>(domain), static_cast<Type>(effective_type),
+                   static_cast<Protocol>(effective_protocol));
 
     IPC::ResponseBuilder rb{ctx, 4};
     rb.Push(ResultSuccess);
@@ -667,28 +684,93 @@ void BSD::Socket(HLERequestContext& ctx) {
 void BSD::Select(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const s32 nfds = rp.Pop<s32>();
-    const s32 timeout = rp.Pop<s32>();
+    // nn::socket::Select sends {s64 tv_sec, s64 tv_usec, bool is_null} 8-byte aligned after nfds.
+    rp.Skip(1, false);
+    const s64 tv_sec = rp.Pop<s64>();
+    const s64 tv_usec = rp.Pop<s64>();
+    const bool no_timeout = rp.Pop<bool>();
+    const s32 timeout =
+        no_timeout ? -1
+                   : static_cast<s32>(std::clamp<s64>(tv_sec * 1000 + (tv_usec + 999) / 1000, 0,
+                                                      std::numeric_limits<s32>::max()));
 
-    LOG_DEBUG(Service, "called. nfds={} timeout={}", nfds, timeout);
+    // Same starvation as Poll(): Sonic Racing CrossWorlds parks three Select(-1) calls on
+    // eventfds, tying up all three BSD threads so the waking eventfd Write() never runs.
+    std::vector<u8> read_in, write_in, error_in;
+    bool had_snapshot = false;
+    std::optional<std::chrono::steady_clock::time_point> existing_deadline;
+    {
+        std::scoped_lock snapshot_lock{deferred_poll_snapshot_mutex};
+        if (const auto it = deferred_select_snapshots.find(&ctx);
+            it != deferred_select_snapshots.end()) {
+            read_in = it->second.read_in;
+            write_in = it->second.write_in;
+            error_in = it->second.error_in;
+            existing_deadline = it->second.deadline;
+            had_snapshot = true;
+        }
+    }
+    if (!had_snapshot) {
+        // Re-checks of a deferred call (every heartbeat) are not logged; they flood the log.
+        LOG_DEBUG(Service, "called. nfds={} timeout={}", nfds, timeout);
+        const auto copy = [&ctx](std::size_t i, std::vector<u8>& out) {
+            if (ctx.CanReadBuffer(i)) {
+                const auto live = ctx.ReadBuffer(i);
+                out.assign(live.begin(), live.end());
+            }
+        };
+        copy(0, read_in);
+        copy(1, write_in);
+        copy(2, error_in);
+    }
 
-    ExecuteWork(ctx, SelectWork{
-                         .nfds = nfds,
-                         .timeout = timeout,
-                         .read_in = ctx.CanReadBuffer(0) ? ctx.ReadBuffer(0) : std::span<const u8>{},
-                         .write_in = ctx.CanReadBuffer(1) ? ctx.ReadBuffer(1) : std::span<const u8>{},
-                         .error_in = ctx.CanReadBuffer(2) ? ctx.ReadBuffer(2) : std::span<const u8>{},
-                         .read_out = std::vector<u8>(ctx.GetWriteBufferSize(0)),
-                         .write_out = std::vector<u8>(ctx.GetWriteBufferSize(1)),
-                         .error_out = std::vector<u8>(ctx.GetWriteBufferSize(2)),
-                     });
+    SelectWork work{
+        .nfds = nfds,
+        .timeout = timeout,
+        .read_in = read_in,
+        .write_in = write_in,
+        .error_in = error_in,
+        .read_out = std::vector<u8>(ctx.GetWriteBufferSize(0)),
+        .write_out = std::vector<u8>(ctx.GetWriteBufferSize(1)),
+        .error_out = std::vector<u8>(ctx.GetWriteBufferSize(2)),
+    };
+
+    if (timeout != 0 && GetBsdDeferralEvent() != nullptr &&
+        SelectSetIncludesEventFd(read_in, write_in, error_in)) {
+        work.timeout = 0;
+        work.Execute(this);
+        const bool nothing_ready = work.ret == 0 && work.bsd_errno == Errno::SUCCESS;
+        const bool expired = existing_deadline && std::chrono::steady_clock::now() >= *existing_deadline;
+        if (nothing_ready && !expired) {
+            if (!had_snapshot) {
+                std::scoped_lock snapshot_lock{deferred_poll_snapshot_mutex};
+                const auto deadline = timeout == -1
+                                          ? std::optional<std::chrono::steady_clock::time_point>{}
+                                          : std::optional{std::chrono::steady_clock::now() +
+                                                          std::chrono::milliseconds(timeout)};
+                deferred_select_snapshots[&ctx] =
+                    DeferredSelectState{read_in, write_in, error_in, deadline};
+                LOG_DEBUG(Service, "Select deferred (nfds={} timeout={}), eventfd in set",
+                          nfds, timeout);
+            }
+            ctx.SetIsDeferred();
+            return;
+        }
+        if (had_snapshot) {
+            std::scoped_lock snapshot_lock{deferred_poll_snapshot_mutex};
+            deferred_select_snapshots.erase(&ctx);
+        }
+        work.Response(ctx);
+        return;
+    }
+
+    ExecuteWork(ctx, std::move(work));
 }
 
 void BSD::Poll(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const s32 nfds = rp.Pop<s32>();
     const s32 timeout = rp.Pop<s32>();
-
-    LOG_DEBUG(Service, "called. nfds={} timeout={}", nfds, timeout);
 
     // [Nextendo] See sockets.h's deferred_poll_snapshots declaration comment: if this ctx was
     // already deferred once, reuse the pollfd bytes captured back then instead of re-reading
@@ -705,6 +787,8 @@ void BSD::Poll(HLERequestContext& ctx) {
         }
     }
     if (!had_snapshot) {
+        // Re-checks of a deferred call (every heartbeat) are not logged; they flood the log.
+        LOG_DEBUG(Service, "called. nfds={} timeout={}", nfds, timeout);
         const auto live_buffer = ctx.ReadBuffer();
         read_buffer.assign(live_buffer.begin(), live_buffer.end());
     }
@@ -746,9 +830,9 @@ void BSD::Poll(HLERequestContext& ctx) {
                                           : std::optional{std::chrono::steady_clock::now() +
                                                            std::chrono::milliseconds(timeout)};
                 deferred_poll_snapshots[&ctx] = DeferredPollState{read_buffer, deadline};
+                LOG_DEBUG(Service, "Poll deferred (nfds={} timeout={}), eventfd in set", nfds,
+                          timeout);
             }
-            LOG_DEBUG(Service, "[Nextendo] Poll deferred (nfds={} timeout={}), eventfd in set",
-                      nfds, timeout);
             ctx.SetIsDeferred();
             return;
         }
@@ -1312,6 +1396,73 @@ bool BSD::PollSetIncludesEventFd(std::span<const u8> read_buffer, s32 nfds) cons
     return false;
 }
 
+// Like FreeBSD, a socket closed by another thread fails the select with EBADF, reported one timeout after the close so the closer is done with it (F13 private lobbies).
+std::pair<s32, Network::Errno> BSD::SelectWait(
+    std::vector<Network::PollFD>& host_pollfds, const std::vector<s32>& polled_fds,
+    const std::vector<std::shared_ptr<Network::SocketBase>>& held_sockets, s32 timeout) {
+    using Clock = std::chrono::steady_clock;
+    auto deadline = Clock::now() + std::chrono::milliseconds(std::max(timeout, 0));
+    std::vector<bool> closed(host_pollfds.size(), false);
+    bool any_closed = false;
+
+    const auto closed_by_other_thread = [&](size_t j) {
+        std::lock_guard lock(fd_table_mutex);
+        const auto& descriptor = file_descriptors[polled_fds[j]];
+        return !descriptor || descriptor->socket != held_sockets[j];
+    };
+
+    while (true) {
+        std::vector<Network::PollFD> live;
+        std::vector<size_t> live_index;
+        for (size_t j = 0; j < host_pollfds.size(); ++j) {
+            host_pollfds[j].revents = Network::PollEvents{};
+            if (!closed[j]) {
+                live.push_back(host_pollfds[j]);
+                live_index.push_back(j);
+            }
+        }
+
+        s32 remaining = timeout;
+        if (timeout > 0) {
+            remaining = static_cast<s32>(std::max<s64>(
+                0, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now())
+                       .count()));
+        }
+        if (live.empty()) {
+            if (remaining > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(remaining));
+            }
+            return {-1, Network::Errno::BADF};
+        }
+
+        auto result = Network::Poll(live, remaining);
+
+        bool newly_closed = false;
+        bool live_event = false;
+        for (size_t k = 0; k < live.size(); ++k) {
+            const size_t j = live_index[k];
+            if (closed_by_other_thread(j)) {
+                closed[j] = true;
+                newly_closed = true;
+                continue;
+            }
+            host_pollfds[j].revents = live[k].revents;
+            live_event |= live[k].revents != Network::PollEvents{};
+        }
+        if (newly_closed && !any_closed && timeout > 0) {
+            deadline = Clock::now() + std::chrono::milliseconds(timeout);
+        }
+        any_closed |= newly_closed;
+
+        if (!any_closed) {
+            return result;
+        }
+        if (live_event || timeout <= 0 || Clock::now() >= deadline) {
+            return {-1, Network::Errno::BADF};
+        }
+    }
+}
+
 std::pair<s32, Errno> BSD::PollImpl(std::vector<u8>& write_buffer, std::span<const u8> read_buffer,
                                     s32 nfds, s32 timeout) {
     if (nfds <= 0) {
@@ -1478,6 +1629,22 @@ void SetFdInMask(std::vector<u8>& mask, s32 fd) {
 }
 } // Anonymous namespace
 
+bool BSD::SelectSetIncludesEventFd(std::span<const u8> read_in, std::span<const u8> write_in,
+                                   std::span<const u8> error_in) {
+    std::vector<s32> fds;
+    ExtractFdsFromMask(read_in, fds);
+    ExtractFdsFromMask(write_in, fds);
+    ExtractFdsFromMask(error_in, fds);
+    std::lock_guard lock(fd_table_mutex);
+    for (const s32 fd : fds) {
+        if (fd >= 0 && fd < static_cast<s32>(MAX_FD) && file_descriptors[fd] &&
+            file_descriptors[fd]->is_eventfd) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::pair<s32, Errno> BSD::SelectImpl(s32 nfds, s32 timeout, std::span<const u8> read_in,
                                       std::span<const u8> write_in, std::span<const u8> error_in,
                                       std::vector<u8>& read_out, std::vector<u8>& write_out,
@@ -1521,22 +1688,28 @@ std::pair<s32, Errno> BSD::SelectImpl(s32 nfds, s32 timeout, std::span<const u8>
 
     std::vector<s32> polled_fds;
     std::vector<Network::PollFD> host_pollfds;
+    std::vector<std::shared_ptr<Network::SocketBase>> held_sockets;
     polled_fds.reserve(entries.size());
     host_pollfds.reserve(entries.size());
-    for (const Entry& entry : entries) {
-        if (entry.fd < 0 || entry.fd >= static_cast<s32>(MAX_FD) || !file_descriptors[entry.fd] ||
-            !file_descriptors[entry.fd]->socket) {
-            continue;
+    {
+        std::lock_guard lock(fd_table_mutex);
+        for (const Entry& entry : entries) {
+            if (entry.fd < 0 || entry.fd >= static_cast<s32>(MAX_FD) ||
+                !file_descriptors[entry.fd] || !file_descriptors[entry.fd]->socket) {
+                continue;
+            }
+            polled_fds.push_back(entry.fd);
+            held_sockets.push_back(file_descriptors[entry.fd]->socket);
+            host_pollfds.push_back(Network::PollFD{
+                .socket = file_descriptors[entry.fd]->socket.get(),
+                .events = entry.requested,
+                .revents = Network::PollEvents{},
+            });
         }
-        polled_fds.push_back(entry.fd);
-        host_pollfds.push_back(Network::PollFD{
-            .socket = file_descriptors[entry.fd]->socket.get(),
-            .events = entry.requested,
-            .revents = Network::PollEvents{},
-        });
     }
 
-    const auto [poll_ret, poll_errno] = Translate(Network::Poll(host_pollfds, timeout));
+    const auto [poll_ret, poll_errno] =
+        Translate(SelectWait(host_pollfds, polled_fds, held_sockets, timeout));
     if (poll_errno != Errno::SUCCESS) {
         return {poll_ret, poll_errno};
     }
@@ -1662,10 +1835,13 @@ Errno BSD::BindImpl(s32 fd, std::span<const u8> addr) {
             }
             return Errno::SUCCESS;
         }
-        descriptor.bound_port = addr_in.portno;
     }
 
     const auto result = Translate(file_descriptors[fd]->socket->Bind(Translate(addr_in)));
+    if (result == Errno::SUCCESS && descriptor.type == Network::Type::DGRAM) {
+        // Only successfully bound sockets may be parked and adopted on a later bind.
+        descriptor.bound_port = addr_in.portno;
+    }
     if (result != Errno::SUCCESS) {
         LOG_ERROR(Service, "Bind fd={} failed with errno={}", fd, static_cast<int>(result));
     }
@@ -1769,10 +1945,13 @@ Errno BSD::ConnectImpl(s32 fd, std::span<const u8> addr) {
              Network::IPv4AddressToRedactedString(addr_in.ip), translated_addr.portno);
 
     const auto result = Translate(file_descriptors[fd]->socket->Connect(translated_addr));
-    if (result == Errno::SUCCESS || result == Errno::INPROGRESS) {
+    if (result == Errno::SUCCESS || result == Errno::INPROGRESS || result == Errno::ISCONN) {
         file_descriptors[fd]->connected = true;
     }
-    if (result != Errno::SUCCESS) {
+    if (result == Errno::ISCONN) {
+        // A guest polling its non-blocking connect() is told the socket is already connected.
+        LOG_DEBUG(Service, "Connect fd={} already connected", fd);
+    } else if (result != Errno::SUCCESS) {
         LOG_ERROR(Service, "Connect fd={} failed with errno={}", fd, static_cast<int>(result));
     } else {
         LOG_INFO(Service, "Connect fd={} succeeded", fd);
@@ -1980,6 +2159,21 @@ Errno BSD::GetSockOptImpl(s32 fd, u32 level, OptName optname, std::vector<u8>& o
         return write_bool_opt(socket->GetKeepAlive());
     case OptName::BROADCAST:
         return write_bool_opt(socket->GetBroadcast());
+    case OptName::SNDBUF:
+    case OptName::RCVBUF: {
+        // A title that sizes a UDP socket reads SO_SNDBUF/SO_RCVBUF back and abandons the
+        // socket on INVAL (UNO's Storm networking does this for every datagram socket).
+        auto [size, getsockopt_err] =
+            optname == OptName::SNDBUF ? socket->GetSndBuf() : socket->GetRcvBuf();
+        if (getsockopt_err == Network::Errno::SUCCESS) {
+            ASSERT_OR_EXECUTE_MSG(
+                optval.size() >= sizeof(u32), { return Errno::INVAL; },
+                "Incorrect getsockopt option size");
+            optval.resize(sizeof(u32));
+            PutValue(optval, size);
+        }
+        return Translate(getsockopt_err);
+    }
     default:
         LOG_WARNING(Service, "(STUBBED) Unimplemented optname={} (0x{:x}), returning INVAL",
                     static_cast<u32>(optname), static_cast<u32>(optname));
@@ -2489,6 +2683,30 @@ std::pair<s32, Errno> BSD::SendToImpl(s32 fd, u32 flags, std::span<const u8> mes
         if (error != Network::Errno::SUCCESS || written != 36)
             return Translate(std::pair<s32, Network::Errno>{-1, error == Network::Errno::SUCCESS ? Network::Errno::INVAL : error});
     }
+    if (!Common::UchAccountTransport::Enabled(system.GetApplicationProcessProgramID()) &&
+        !descriptor.is_connection_based && p_addr_in) {
+        std::array<u8, NextendoUch::FrameSize> frame{};
+        switch (NextendoUch::Bootstrap(system.GetApplicationProcessProgramID(), message,
+                                       p_addr_in->ip, p_addr_in->portno, frame)) {
+        case NextendoUch::BootstrapResult::NotApplicable:
+            break;
+        case NextendoUch::BootstrapResult::Refused:
+            return {-1, Errno::CONNREFUSED};
+        case NextendoUch::BootstrapResult::SendFrame: {
+            const auto [sent, send_errno] =
+                file_descriptors[fd]->socket->SendTo(flags, std::span<const u8>(frame), p_addr_in);
+            frame.fill(0);
+            if (send_errno != Network::Errno::SUCCESS) {
+                return Translate(std::make_pair(sent, send_errno));
+            }
+            if (sent != static_cast<s32>(NextendoUch::FrameSize)) {
+                return {-1, Errno::MSGSIZE};
+            }
+            break;
+        }
+        }
+    }
+
     const auto sent = file_descriptors[fd]->socket->SendTo(flags, message, p_addr_in);
     if (descriptor.type == Network::Type::DGRAM) {
         TraceUnoDatagram(system.GetApplicationProcessProgramID(), "send-to", fd, message.size(),
@@ -2520,8 +2738,16 @@ Errno BSD::CloseImpl(s32 fd) {
         file_descriptors[fd].reset();
     }
 
+    const auto program_id = system.GetApplicationProcessProgramID();
+    // Sword/Shield closes its local Y-Comm listener when transitioning online.
+    // Retaining that fixed port prevents another instance from initializing Y-Comm.
+    const bool is_swsh_local_listener =
+        (program_id == 0x0100ABF008968000ULL || program_id == 0x01008DB008C2C000ULL) &&
+        bound_port == Common::swap16(u16{12345});
+
     // Connected means one peer, so closing it is a real teardown, not the probe/play port swap.
-    if (is_udp && bound_port > 0 && !was_connected && !was_shut_down) {
+    if (is_udp && bound_port > 0 && !was_connected && !was_shut_down &&
+        !is_swsh_local_listener) {
         if (ParkUdpSocket(socket_to_close, bound_port)) {
             LOG_INFO(Service, "[Nextendo] Parking UDP socket fd={} bound to port {}", fd,
                      bound_port);
@@ -3180,7 +3406,21 @@ void BSD::RecvMMsg(HLERequestContext& ctx) {
             LOG_INFO(Service, "[Nextendo][SCHED-WATCH] RecvMMsg (pre-recv) on thread id={} prio={}",
                      cur ? cur->GetThreadId() : 0, cur ? cur->GetPriority() : -1);
         }
-        auto [ret, recv_errno] = RecvImpl(fd, flags | msg.flags, received);
+        const FileDescriptor& descriptor = *file_descriptors[fd];
+        s32 ret;
+        Errno recv_errno;
+        if (!descriptor.is_connection_based && !descriptor.connected) {
+            // An unconnected datagram socket (WebRTC's ICE socket) needs recvfrom(): RecvImpl
+            // never reads one, and the sender must be reported in msg_name.
+            std::vector<u8> from;
+            std::tie(ret, recv_errno) = RecvFromImpl(fd, flags | msg.flags, received, from);
+            if (recv_errno == Errno::SUCCESS && !msg.name.empty()) {
+                std::fill(msg.name.begin(), msg.name.end(), u8{0});
+                std::copy_n(from.begin(), std::min(from.size(), msg.name.size()), msg.name.begin());
+            }
+        } else {
+            std::tie(ret, recv_errno) = RecvImpl(fd, flags | msg.flags, received);
+        }
         if (recv_errno != Errno::SUCCESS) {
             last_errno = recv_errno;
             break;

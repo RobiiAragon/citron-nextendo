@@ -79,6 +79,8 @@ struct Binding {
     BufferId buffer_id;
     /// Non-zero when the GPU range spans device memory that is not contiguous.
     GPUVAddr scattered_gpu_addr{};
+    /// Non-zero when writes mark only this many bytes from the start as GPU-modified.
+    u32 tracked_size{};
 };
 
 struct TextureBufferBinding : Binding {
@@ -472,7 +474,7 @@ public:
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
-    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, u32 cbuf_offset,
                                                bool is_written) const;
 
     /// Resolves the buffers behind each contiguous piece of a scattered storage buffer.
@@ -507,6 +509,8 @@ public:
     struct ScatteredStorage {
         GPUVAddr gpu_addr{};
         u32 size{};
+        /// Bytes from gpu_addr a write-back marks GPU-modified (Binding::tracked_size or size).
+        u32 tracked_size{};
         boost::container::small_vector<std::pair<GPUVAddr, DAddr>, 8> piece_addrs;
         boost::container::small_vector<size_t, 8> piece_sizes;
         std::unique_ptr<Buffer> buffer;

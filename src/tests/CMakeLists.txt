@@ -8,6 +8,7 @@ add_executable(tests
     common/fibers.cpp
     common/host_memory.cpp
     common/logging.cpp
+    common/nextendo_compatible_titles.cpp
     common/param_package.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
@@ -15,9 +16,15 @@ add_executable(tests
     common/unique_function.cpp
     common/uint128.cpp
     core/core_timing.cpp
+    core/loader/nextendo_amongus_patch.cpp
+    core/loader/nextendo_jd22_patch.cpp
+    core/hle/service/acc/nextendo_account_country.cpp
+    core/hle/service/olsc/nextendo_island.cpp
+    core/hle/service/sockets/nextendo_uch.cpp
     core/internal_network/network.cpp
     precompiled_headers.h
     video_core/memory_tracker.cpp
+    video_core/vp9_segmentation.cpp
     input_common/calibration_configuration_job.cpp
 )
 

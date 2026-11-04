@@ -163,7 +163,6 @@ public:
     bool NextendoByamlSkipped(u64 title_id) const;
     static bool NextendoByamlDownloadEnabled();
     void InstallSsbuSkylineMods(u64 program_id);
-    void InstallMk8dCountryFlag(u64 program_id);
     bool IsConfiguring() const {
         return m_is_configuring;
     }
@@ -538,16 +537,6 @@ private:
     SsbuModInstallOutcome InstallSsbuSkylineModsBlocking(u64 program_id);
     void RunSsbuSkylineModsInstallWithProgress(u64 program_id);
 
-    struct Mk8dCountryFlagOutcome {
-        bool success = false;
-        std::string error;
-        std::string release_page_url;
-        std::string detected_version;
-    };
-    Mk8dCountryFlagOutcome InstallMk8dCountryFlagBlocking(u64 program_id,
-                                                          std::string country_code);
-    void RunMk8dCountryFlagInstallWithProgress(u64 program_id, const std::string& country_code);
-
     bool user_flag_cmd_line = false;
     bool auto_paused = false;
     bool auto_muted = false;
@@ -567,6 +556,7 @@ private:
     QTranslator translator;
     QProgressDialog* install_progress;
     QString last_filename_booted;
+    QString last_scanned_amiibo_id;
     QtAmiiboSettingsDialog* cabinet_applet = nullptr;
     QtControllerSelectorDialog* controller_applet = nullptr;
     QtProfileSelectionDialog* profile_select_applet = nullptr;

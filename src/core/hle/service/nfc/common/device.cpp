@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <string_view>
+
 #include "core/hle/service/glue/time/static.h"
 #include "core/hle/service/psc/time/steady_clock.h"
 #ifdef _MSC_VER
@@ -107,7 +110,7 @@ void NfcDevice::NpadUpdate(Core::HID::ControllerTriggerType type) {
     switch (nfc_status.state) {
     case Common::Input::NfcState::NewAmiibo:
         LoadNfcTag(nfc_status.protocol, nfc_status.tag_type, nfc_status.uuid_length,
-                   nfc_status.uuid);
+                   nfc_status.uuid, nfc_status.virtual_amiibo);
         break;
     case Common::Input::NfcState::AmiiboRemoved:
         if (device_state == DeviceState::Initialized || device_state == DeviceState::TagRemoved) {
@@ -122,7 +125,8 @@ void NfcDevice::NpadUpdate(Core::HID::ControllerTriggerType type) {
     }
 }
 
-bool NfcDevice::LoadNfcTag(u8 protocol, u8 tag_type, u8 uuid_length, UniqueSerialNumber uuid) {
+bool NfcDevice::LoadNfcTag(u8 protocol, u8 tag_type, u8 uuid_length, UniqueSerialNumber uuid,
+                           bool virtual_amiibo) {
     if (device_state != DeviceState::SearchingForTag) {
         LOG_ERROR(Service_NFC, "Game is not looking for nfc tag, current state {}", device_state);
         return false;
@@ -140,6 +144,7 @@ bool NfcDevice::LoadNfcTag(u8 protocol, u8 tag_type, u8 uuid_length, UniqueSeria
         .tag_type = static_cast<TagType>(tag_type),
     };
 
+    is_virtual_amiibo = virtual_amiibo;
     device_state = DeviceState::TagFound;
     deactivate_event->GetReadableEvent().Clear();
     activate_event->Signal();
@@ -193,6 +198,7 @@ void NfcDevice::CloseNfcTag() {
     }
 
     device_state = DeviceState::TagRemoved;
+    is_virtual_amiibo = false;
     encrypted_tag_data = {};
     tag_data = {};
     activate_event->GetReadableEvent().Clear();
@@ -634,7 +640,7 @@ Result NfcDevice::Restore() {
         LOG_ERROR(Service_NFP, "Regenerating mii data");
         Mii::StoreData new_mii{};
         new_mii.BuildRandom(Mii::Age::All, Mii::Gender::All, Mii::Race::All);
-        new_mii.SetNickname({u'y', u'u', u'z', u'u', u'\0'});
+        new_mii.SetNickname({u'P', u'l', u'a', u'y', u'e', u'r'});
 
         tag_data.owner_mii.BuildFromStoreData(new_mii);
         tag_data.mii_extension.SetFromStoreData(new_mii);
@@ -1385,8 +1391,12 @@ NFP::AmiiboName NfcDevice::GetAmiiboName(const NFP::AmiiboSettings& settings) co
     }
 
     // Convert from utf16 to utf8
-    const auto amiibo_name_utf8 = Common::UTF16ToUTF8(settings_amiibo_name.data());
-    memcpy(amiibo_name.data(), amiibo_name_utf8.data(), amiibo_name_utf8.size());
+    const auto name_end =
+        std::find(settings_amiibo_name.begin(), settings_amiibo_name.end(), u'\0');
+    const auto amiibo_name_utf8 = Common::UTF16ToUTF8(std::u16string_view{
+        settings_amiibo_name.data(), static_cast<std::size_t>(name_end - settings_amiibo_name.begin())});
+    const auto copy_size = std::min(amiibo_name_utf8.size(), amiibo_name.size() - 1);
+    memcpy(amiibo_name.data(), amiibo_name_utf8.data(), copy_size);
 
     return amiibo_name;
 }
@@ -1396,9 +1406,22 @@ void NfcDevice::SetAmiiboName(NFP::AmiiboSettings& settings,
     std::array<char16_t, NFP::amiibo_name_length> settings_amiibo_name{};
 
     // Convert from utf8 to utf16
-    const auto amiibo_name_utf16 = Common::UTF8ToUTF16(amiibo_name.data());
-    memcpy(settings_amiibo_name.data(), amiibo_name_utf16.data(),
-           amiibo_name_utf16.size() * sizeof(char16_t));
+    // RegisterInfoPrivate carries a fixed-size UTF-8 buffer, while the tag
+    // stores at most ten UTF-16 code units. Treat the input as bounded and
+    // truncate before copying so a long or unterminated name cannot corrupt
+    // the following amiibo settings fields.
+    const auto name_utf8 = Common::StringFromFixedZeroTerminatedBuffer(
+        std::string_view{amiibo_name.data(), amiibo_name.size()}, amiibo_name.size());
+    const auto amiibo_name_utf16 = Common::UTF8ToUTF16(name_utf8);
+    const auto copy_size = std::min(amiibo_name_utf16.size(), settings_amiibo_name.size());
+    std::copy_n(amiibo_name_utf16.begin(), copy_size, settings_amiibo_name.begin());
+
+    // Do not leave an unpaired high surrogate if the ten-unit boundary lands
+    // in the middle of a supplementary Unicode character.
+    if (copy_size == settings_amiibo_name.size() && copy_size != 0 &&
+        settings_amiibo_name.back() >= 0xD800 && settings_amiibo_name.back() <= 0xDBFF) {
+        settings_amiibo_name.back() = 0;
+    }
 
     // Convert from little endian to big endian
     for (std::size_t i = 0; i < NFP::amiibo_name_length; i++) {
@@ -1500,7 +1523,7 @@ void NfcDevice::BuildAmiiboWithoutKeys(NFP::NTAG215File& stubbed_tag_data,
     settings.write_date = GetAmiiboDate(GetCurrentPosixTime());
 
     // Register info
-    SetAmiiboName(settings, {'y', 'u', 'z', 'u', 'A', 'm', 'i', 'i', 'b', 'o'});
+    SetAmiiboName(settings, {'A', 'm', 'i', 'i', 'b', 'o'});
     settings.settings.font_region.Assign(0);
     settings.init_date = GetAmiiboDate(GetCurrentPosixTime());
     store_data.BuildBase(Mii::Gender::Male);

@@ -457,6 +457,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_extended_dynamic_state_3_enables =
             allow_eds3 && device.IsExtExtendedDynamicState3EnablesSupported(),
         .has_dynamic_vertex_input = allow_eds3 && device.IsExtVertexInputDynamicStateSupported(),
+        .needs_vertex_stride_alignment = device.GetVendorID() == 0x1002,
         .has_transform_feedback = device.IsExtTransformFeedbackSupported(),
         .has_mixed_attachment_samples = device.IsMixedAttachmentSamplesSupported(),
     };
@@ -707,10 +708,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    const auto& state = maxwell3d->draw_manager->GetDrawState();
-    if (state.index_buffer.count <= 32 || state.vertex_buffer.count <= 32) {
-        return pipeline;
-    }
+    // Asynchronous means no draw waits for its pipeline: waiting for every draw of 32 vertices or
+    // fewer stalled on full-screen passes, HUD and menu quads, which are most new pipelines.
     return nullptr;
 }
 
