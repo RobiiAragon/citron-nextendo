@@ -46,6 +46,8 @@ add_test(NAME account-caller-identity COMMAND ${Python3_EXECUTABLE}
 
 find_package(Qt6 COMPONENTS Core QUIET)
 if(TARGET Qt6::Core)
+    set(THREAD_SHUTDOWN_SANITIZERS ${BETA54_3_SANITIZERS} CACHE BOOL "" FORCE)
+    add_subdirectory(../thread_shutdown thread_shutdown)
     add_executable(temporary-directory temporary-directory.cpp)
     target_include_directories(temporary-directory PRIVATE ../../src)
     target_link_libraries(temporary-directory PRIVATE Qt6::Core)
