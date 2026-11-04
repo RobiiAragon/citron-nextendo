@@ -40,6 +40,9 @@ endif()
 add_test(NAME profile-ipc-latency COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/profile-ipc-latency.py
     --compiler ${CMAKE_CXX_COMPILER} ${profile_test_flags})
+add_test(NAME account-caller-identity COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/account-caller-identity.py
+    --compiler ${CMAKE_CXX_COMPILER} ${profile_test_flags})
 
 find_package(Qt6 COMPONENTS Core QUIET)
 if(TARGET Qt6::Core)
