@@ -509,6 +509,7 @@ private:
     QTimer status_bar_update_timer;
     std::unique_ptr<QtConfig> config;
     bool emulation_running = false;
+    bool emulation_stop_in_progress = false;
     /// Set for the duration of closeEvent; blocks UpdateInputDrivers / SDL pump during teardown.
     bool main_window_is_closing = false;
     std::unique_ptr<EmuThread> emu_thread;
