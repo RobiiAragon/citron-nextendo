@@ -150,6 +150,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "audio_core/sink/sink.h"
 #include "citron/about_dialog.h"
 #include "citron/bootmanager.h"
+#include "citron/thread_shutdown.h"
+#include <QScopedValueRollback>
 #include "citron/compatdb.h"
 #include "citron/compatibility_list.h"
 #include "citron/configuration/configure_dialog.h"
@@ -2977,6 +2979,10 @@ void GMainWindow::OnEmulationStopTimeExpired() {
 }
 
 void GMainWindow::OnEmulationStopped() {
+    if (emulation_stop_in_progress) {
+        return;
+    }
+    QScopedValueRollback<bool> stopping{emulation_stop_in_progress, true};
     // Every shutdown path lands here; ShutdownGame() is bypassed by the Stop button.
     play_time_manager->Stop();
     SyncNextendoHistory();
@@ -2985,7 +2991,7 @@ void GMainWindow::OnEmulationStopped() {
     shutdown_timer.stop();
     if (emu_thread) {
         emu_thread->disconnect();
-        emu_thread->wait();
+        Frontend::WaitForThreadWithEvents(*emu_thread);
         emu_thread.reset();
     }
 

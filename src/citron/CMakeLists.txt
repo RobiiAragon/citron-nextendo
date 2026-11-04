@@ -52,6 +52,7 @@ add_executable(citron
     applets/qt_web_browser_scripts.h
     bootmanager.cpp
     bootmanager.h
+    thread_shutdown.h
     controller_overlay.cpp
     controller_overlay.h
     compatdb.ui

@@ -1,0 +1,22 @@
+name: Test GUI thread shutdown
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['src/citron/**', 'tests/thread_shutdown/**', '.github/workflows/test-thread-shutdown.yml']
+permissions:
+  contents: read
+jobs:
+  shutdown:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        sanitizers: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y qt6-base-dev
+      - run: cmake -S tests/thread_shutdown -B build/thread-shutdown -DCMAKE_BUILD_TYPE=Debug -DTHREAD_SHUTDOWN_SANITIZERS=${{ matrix.sanitizers }}
+      - run: cmake --build build/thread-shutdown --parallel 2
+      - run: ctest --test-dir build/thread-shutdown --output-on-failure
